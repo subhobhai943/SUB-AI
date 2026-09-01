@@ -6,164 +6,210 @@
 
 ## Project Identity
 
-- **Repo:** `subhobhai943/SUB-AI`
+- **Repo:** `subhobhai943/SUB-AI` (public)
 - **Owner:** Subhadip (brand: SUB)
-- **Goal:** Build a language model **entirely from scratch** in Python + PyTorch. Custom architecture, custom weight initialization, custom training loop, custom tokenizer. No Hugging Face weights. No pretrained checkpoints. No `transformers` library. Every tensor starts as `torch.randn(...)` and is learned from raw text.
+- **Goal:** Build a complete AI language model from scratch in one repo — C inference engine first, then the PyTorch training stack. No Hugging Face. No pretrained weights. No `transformers` library.
 - **License:** GPL-2.0
-- **All commits go to `main` branch only.**
+- **All commits go to `main` branch only. No feature branches.**
 
 ---
 
 ## Important Context
 
-This is a greenfield project. There is **no existing inference engine**, no existing model code, and no existing weights. You are building everything from scratch. The only existing files in the repo are `README.md`, `LICENSE`, and this `ai-prompt.md`.
+This is a **greenfield project**. No model code, no weights, no engine exists yet. The only files currently in the repo are `README.md`, `LICENSE`, and this `ai-prompt.md`.
 
-A future goal (Phase 10, out of scope for now) is to build a C inference engine that can load the exported weights — but that does not exist yet and you should NOT reference it as if it does.
+The build order is intentional:
+1. **C engine first** — define the binary weight format before training, so the C loader and the Python exporter always agree
+2. **Python architecture** — matches the C engine’s expected tensor layout exactly
+3. **Weights from scratch** — randomly initialized, no downloads
+4. **Training loop** — PyTorch, runs on Colab T4
+5. **Export + integration test** — train in Python, run in C
 
 ---
 
 ## Hard Rules
 
-1. **No pretrained weights** — never call `from_pretrained()` or download any model checkpoint.
-2. **No Hugging Face `transformers` library** — allowed packages: `torch`, `torch.nn`, `torch.nn.functional`, `numpy`, `requests`, standard Python only.
-3. **All weights initialized from scratch:**
-   - Linear/embedding weights: `nn.init.normal_(w, mean=0.0, std=0.02)`
-   - Biases: `nn.init.zeros_`
+1. **No pretrained weights** — never call `from_pretrained()`, never download model checkpoints.
+2. **No `transformers` library** — allowed: `torch`, `torch.nn`, `torch.nn.functional`, `numpy`, `requests`, `struct`, `argparse`, standard Python/C only.
+3. **Weight init from scratch:**
+   - Linear/embedding: `nn.init.normal_(w, mean=0.0, std=0.02)`
+   - Bias: `nn.init.zeros_`
    - LayerNorm gain: `nn.init.ones_`, bias: `nn.init.zeros_`
-   - Residual projection weights: `std = 0.02 / sqrt(2 * n_layers)` (GPT-2 style depth scaling)
-4. **All commits on `main`** — no feature branches.
-5. **Delete `ai-prompt.md`** as the very last commit with message `[cleanup] Delete ai-prompt.md`.
-6. Each file must have a top-of-file docstring explaining what it does.
-7. Keep code clean, readable, and well-commented.
+   - Residual projections: `std = 0.02 / sqrt(2 * n_layers)` (GPT-2 depth scaling)
+4. **C code:** use only C99 standard library (`stdio.h`, `stdlib.h`, `math.h`, `string.h`, `stdint.h`). No external C libraries.
+5. All commits on `main`. Delete this file last.
+6. Every file must have a top-of-file comment/docstring explaining what it does.
 
 ---
 
-## Architecture Spec
+## SUBA Binary Weight Format
 
-Build a **decoder-only Transformer** (GPT-style).
+This format is the contract between the Python exporter and the C loader. Define it first and never change it without updating both sides.
 
-```python
-# model/config.py
-@dataclass
-class SUBConfig:
-    vocab_size   : int   = 8000    # learned from byte-level BPE tokenizer
-    context_len  : int   = 512     # max sequence length
-    n_embd       : int   = 256     # embedding dimension
-    n_heads      : int   = 8       # attention heads (head_dim = 32)
-    n_layers     : int   = 6       # number of transformer blocks
-    dropout      : float = 0.1
-    bias         : bool  = False   # no bias in linear layers
-    ffn_mult     : int   = 4       # FFN hidden dim = n_embd * ffn_mult
+```
+Header (256 bytes, little-endian uint32):
+  [0]  magic      = 0x53554241  (ASCII: 'SUBA')
+  [1]  version    = 1
+  [2]  vocab_size
+  [3]  context_len
+  [4]  n_embd
+  [5]  n_heads
+  [6]  n_layers
+  [7..63] zero padding
+
+Weights (float32, row-major, packed, no alignment padding):
+  token_embedding      [vocab_size, n_embd]
+  pos_embedding        [context_len, n_embd]
+  for each block i in 0..n_layers-1:
+    ln1.weight         [n_embd]
+    ln1.bias           [n_embd]
+    attn.qkv.weight    [3*n_embd, n_embd]
+    attn.proj.weight   [n_embd, n_embd]
+    ln2.weight         [n_embd]
+    ln2.bias           [n_embd]
+    mlp.fc1.weight     [4*n_embd, n_embd]
+    mlp.fc2.weight     [n_embd, 4*n_embd]
+  final_ln.weight      [n_embd]
+  final_ln.bias        [n_embd]
+  lm_head.weight       [vocab_size, n_embd]  (weight-tied = same data as token_embedding)
 ```
 
-This gives ~10M parameters, trainable on a free Colab T4 GPU.
+---
+
+## Phase 1 — C LLM Engine (`engine/`)
+
+Build each file in this order:
+
+### `engine/loader.h` + `engine/loader.c`
+- `ModelHeader` struct matching the binary format above
+- `ModelWeights` struct with float pointers to each tensor region
+- `load_model(const char *path, ModelHeader *hdr, ModelWeights *w)` — mmap or fread the .bin file, set all pointers into the weight buffer
+- `free_model(ModelWeights *w)`
+
+### `engine/matmul.c` + `engine/matmul.h`
+- `matmul(float *out, const float *x, const float *w, int n, int d)` — x[n] @ w[d,n]^T → out[d]
+- `softmax(float *x, int n)` — in-place numerically stable softmax
+- `gelu(float x) -> float` — exact GELU: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))`
+- `rmsnorm(float *out, const float *x, const float *w, int n)` — RMS normalization
+- `layernorm(float *out, const float *x, const float *w, const float *b, int n)` — standard LayerNorm
+
+### `engine/kvcache.h` + `engine/kvcache.c`
+- `KVCache` struct: float arrays for keys and values, shape `[n_layers, context_len, n_heads, head_dim]`
+- `kvcache_init(KVCache *kv, ModelHeader *hdr)`
+- `kvcache_free(KVCache *kv)`
+- `kvcache_reset(KVCache *kv)` — zero the cache for new conversation
+
+### `engine/model.h` + `engine/model.c`
+- `transformer_forward(float *logits, int token, int pos, ModelHeader *hdr, ModelWeights *w, KVCache *kv)`
+- Implements one forward pass: embed → N blocks (attention + MLP) → final layernorm → lm_head projection
+- Attention block: QKV projection → split heads → scaled dot-product with causal mask → write to KV cache → attend → project
+- MLP block: fc1 → GELU → fc2
+
+### `engine/sampler.h` + `engine/sampler.c`
+- `sample_argmax(float *logits, int vocab_size) -> int`
+- `sample_topp(float *logits, int vocab_size, float temperature, float top_p) -> int`
+- `sample_topk(float *logits, int vocab_size, float temperature, int top_k) -> int`
+
+### `engine/tokenizer.h` + `engine/tokenizer.c`
+- Loads `tokenizer.json` (same file saved by Python tokenizer)
+- `tokenizer_encode(Tokenizer *t, const char *text, int *out_ids, int *out_len)`
+- `tokenizer_decode(Tokenizer *t, int id) -> const char*`
+
+### `engine/inference.c`
+- `main()` — CLI: `./inference --model model.bin --tokenizer data/tokenizer.json --prompt "hello" --max_tokens 200 --temperature 0.8 --top_k 40`
+- Loads model + tokenizer, runs autoregressive generation loop, prints tokens as they are generated
+
+### `engine/Makefile`
+```makefile
+CC = gcc
+CFLAGS = -O2 -Wall -std=c99 -lm
+SRCS = inference.c loader.c matmul.c kvcache.c model.c sampler.c tokenizer.c
+OBJS = $(SRCS:.c=.o)
+
+all: inference
+
+inference: $(OBJS)
+	$(CC) $(CFLAGS) -o inference $(OBJS)
+
+clean:
+	rm -f $(OBJS) inference
+```
 
 ---
 
-## File-by-File Implementation Plan
+## Phase 2 — Model Architecture (PyTorch) (`model/`)
 
 ### `model/config.py`
-- `SUBConfig` dataclass with the hyperparams above
-- Three class-method presets: `SUBConfig.small()`, `SUBConfig.medium()`, `SUBConfig.large()`
-  - small: default above (~10M params)
-  - medium: n_embd=512, n_heads=8, n_layers=8 (~50M params)
-  - large: n_embd=768, n_heads=12, n_layers=12 (~120M params)
+```python
+@dataclass
+class SUBConfig:
+    vocab_size  : int   = 8000
+    context_len : int   = 512
+    n_embd      : int   = 256
+    n_heads     : int   = 8       # head_dim = n_embd // n_heads = 32
+    n_layers    : int   = 6
+    dropout     : float = 0.1
+    bias        : bool  = False
+    ffn_mult    : int   = 4
+```
+Add `small()`, `medium()` (n_embd=512, n_layers=8), `large()` (n_embd=768, n_layers=12) class-method presets.
 
 ### `model/architecture.py`
-- `CausalSelfAttention(config)` — multi-head causal self-attention using `F.scaled_dot_product_attention` with `is_causal=True`
-- `MLP(config)` — two `nn.Linear` layers with GELU activation, no bias
-- `Block(config)` — Pre-LN: `LayerNorm → Attention → residual` + `LayerNorm → MLP → residual`
-- `SUBModel(config)` — token embedding + positional embedding + N blocks + final LayerNorm + LM head (weight-tied to token embedding)
-- `SUBModel.forward(idx, targets=None)` — returns `(logits, loss)` where loss is cross-entropy if targets provided
-- `SUBModel.generate(idx, max_new_tokens, temperature=1.0, top_k=None)` — autoregressive sampling
-- `SUBModel.count_params()` — returns total and non-embedding parameter count
+- `CausalSelfAttention` — uses `F.scaled_dot_product_attention(is_causal=True)`
+- `MLP` — fc1 → GELU → fc2, no bias
+- `Block` — Pre-LN residual connections
+- `SUBModel` — token emb + pos emb + blocks + final LN + LM head (weight-tied to token emb)
+- `SUBModel.forward(idx, targets=None)` returns `(logits, loss)`
+- `SUBModel.generate(idx, max_new_tokens, temperature=1.0, top_k=None)`
 
 ### `model/init.py`
-- `init_weights(model: SUBModel)` function
-- Iterates over all named modules, applies init rules from the Hard Rules section above
-- Residual projections (attn output proj + mlp fc2) use the depth-scaled std
+- `init_weights(model)` applying init rules from Hard Rules above
+- Residual proj std = `0.02 / sqrt(2 * n_layers)`
 
-### `tokenizer/tokenizer.py`
-- `ByteLevelBPETokenizer` class, fully from scratch (no `tiktoken`, no `sentencepiece`)
-- Seed vocabulary = all 256 byte values (ids 0–255)
-- Methods:
-  - `train(text: str, vocab_size: int)` — learn BPE merges greedily from raw text
-  - `encode(text: str) -> list[int]` — apply learned merges
-  - `decode(ids: list[int]) -> str` — reconstruct text
-  - `save(path: str)` — serialize vocab + merges to JSON
-  - `load(path: str)` — deserialize from JSON
-  - `__len__()` — returns current vocab size
+---
 
-### `data/prepare.py`
-- Downloads **TinyShakespeare** as the default dataset:
-  `https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt`
-- Trains the `ByteLevelBPETokenizer` on the full corpus with `vocab_size=8000`
-- Saves tokenizer to `data/tokenizer.json`
-- Tokenizes the full corpus
-- Splits 90% train / 10% val
-- Saves as `data/train.npy` and `data/val.npy` (numpy uint16 arrays)
-- Prints stats: total tokens, train tokens, val tokens, vocab size
+## Phase 3 — Tokenizer (Python) (`tokenizer/tokenizer.py`)
 
-### `train.py`
-- Loads config (default: `SUBConfig.small()`), model, tokenizer, and `.npy` data files
-- `get_batch(split, config)` — randomly samples `(x, y)` tensors of shape `(batch_size, context_len)` from the data, moved to GPU
-- Training loop:
-  - **Optimizer:** AdamW, `lr=6e-4`, `betas=(0.9, 0.95)`, `weight_decay=0.1`, no weight decay on bias/LayerNorm
-  - **LR Schedule:** cosine decay with linear warmup (warmup_steps=100), min_lr = max_lr / 10
-  - **Gradient clipping:** `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`
-  - Log train loss every 100 steps
-  - Evaluate val loss every 500 steps (model in eval mode, no grad)
-  - Save checkpoint every 500 steps to `checkpoints/ckpt_{step}.pt` (saves model state, optimizer state, config, step)
-- CLI args via `argparse`:
-  - `--steps INT` (default 5000)
-  - `--batch_size INT` (default 32)
-  - `--resume` flag — auto-loads latest checkpoint from `checkpoints/`
-  - `--config [small|medium|large]` (default small)
+- `ByteLevelBPETokenizer` from scratch, no external tokenizer libs
+- Seed vocab: 256 byte values (ids 0–255)
+- `train(text, vocab_size)`, `encode(text)`, `decode(ids)`, `save(path)`, `load(path)`
+- Save format: JSON with `vocab` dict and ordered `merges` list — same file the C tokenizer reads
+
+---
+
+## Phase 4 — Data Pipeline (`data/prepare.py`)
+
+- Download TinyShakespeare from `https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt`
+- Train tokenizer on full corpus, `vocab_size=8000`, save to `data/tokenizer.json`
+- Tokenize corpus, split 90/10, save as `data/train.npy` and `data/val.npy` (numpy uint16)
+- Print: total tokens, vocab size, train/val split sizes
+
+---
+
+## Phase 5 — Training Loop (`train.py`)
+
+- Load config, build model, apply `init_weights`, move to GPU
+- `get_batch(split)` — random (x, y) pairs of shape `(batch_size, context_len)`
+- AdamW: `lr=6e-4`, `betas=(0.9,0.95)`, `weight_decay=0.1` (skip decay for 1D params)
+- Cosine LR with 100-step linear warmup, min_lr = max_lr / 10
+- Grad clip: `clip_grad_norm_(1.0)`
+- Log train loss every 100 steps
+- Eval val loss every 500 steps
+- Save checkpoint every 500 steps: `checkpoints/ckpt_{step}.pt`
+- CLI: `--steps`, `--batch_size`, `--resume`, `--config [small|medium|large]`
+
+---
+
+## Phase 6 — Export + Integration
 
 ### `export.py`
-- Loads a `.pt` checkpoint
-- Writes a flat `model.bin` file in the following binary format:
-  ```
-  Header (256 bytes, little-endian):
-    magic     : uint32 = 0x53554241  (ASCII 'SUBA')
-    version   : uint32 = 1
-    vocab_size: uint32
-    ctx_len   : uint32
-    n_embd    : uint32
-    n_heads   : uint32
-    n_layers  : uint32
-    [remaining bytes zero-padded to 256 bytes]
-
-  Weights (float32, row-major, no padding between tensors):
-    token_embedding    [vocab_size, n_embd]
-    pos_embedding      [context_len, n_embd]
-    for each block i in 0..n_layers:
-      block.ln1.weight   [n_embd]
-      block.ln1.bias     [n_embd]
-      block.attn.qkv_w   [3*n_embd, n_embd]
-      block.attn.proj_w  [n_embd, n_embd]
-      block.ln2.weight   [n_embd]
-      block.ln2.bias     [n_embd]
-      block.mlp.fc1_w    [4*n_embd, n_embd]
-      block.mlp.fc2_w    [n_embd, 4*n_embd]
-    final_ln.weight    [n_embd]
-    final_ln.bias      [n_embd]
-    lm_head.weight     [vocab_size, n_embd]  (same data as token_embedding due to weight tying)
-  ```
+- Load `.pt` checkpoint, extract tensors in the exact order defined in the SUBA binary format above
+- Write header (256 bytes) then all weights as float32 little-endian
 - Usage: `python export.py --checkpoint checkpoints/ckpt_5000.pt --out model.bin`
 
-### `inference.py`
-- Loads a checkpoint `.pt` file (not the `.bin` — that's for the future C engine)
-- Loads the tokenizer from `data/tokenizer.json`
-- Encodes the prompt, runs `model.generate()`, decodes and prints output
-- Usage: `python inference.py --checkpoint checkpoints/ckpt_5000.pt --prompt "Once upon a time" --max_tokens 200 --temperature 0.8 --top_k 40`
-
-### `requirements.txt`
-```
-torch>=2.0.0
-numpy
-requests
-```
+### End-to-end test
+- Run `data/prepare.py` → `train.py` → `export.py` → `make -C engine` → `./engine/inference --model model.bin --prompt "Once upon"`
+- Confirm tokens stream to stdout from the C engine
 
 ---
 
@@ -172,30 +218,49 @@ requests
 ```
 [phase] short description
 ```
-
-Examples:
-- `[config] Add SUBConfig dataclass with small/medium/large presets`
+- `[engine] Add SUBA loader: ModelHeader, ModelWeights, load_model`
+- `[engine] Add matmul, softmax, gelu, layernorm`
+- `[engine] Add KV-cache init/reset/free`
+- `[engine] Add transformer forward pass`
+- `[engine] Add top-k sampler`
+- `[engine] Add C tokenizer, Makefile`
+- `[arch] Add SUBConfig with presets`
 - `[arch] Implement CausalSelfAttention, MLP, Block, SUBModel`
-- `[init] Custom weight initialization with depth scaling`
-- `[tokenizer] Byte-level BPE train/encode/decode/save/load`
-- `[data] TinyShakespeare download, tokenize, train/val split`
-- `[train] AdamW loop with cosine LR, grad clip, checkpointing`
-- `[export] Write model.bin in SUBA binary format`
-- `[inference] Python text generation from checkpoint`
+- `[init] Custom weight init with depth scaling`
+- `[tokenizer] Byte-level BPE from scratch`
+- `[data] TinyShakespeare prep, tokenize, split`
+- `[train] AdamW + cosine LR + checkpointing`
+- `[export] Write SUBA .bin weight file`
+- `[test] End-to-end: Python train → C inference`
 - `[cleanup] Delete ai-prompt.md`
 
 ---
 
-## Final Checklist (Delete This File Only After All Are Done)
+## Final Checklist
 
-- [ ] `model/config.py` — SUBConfig + small/medium/large presets
-- [ ] `model/architecture.py` — full model with generate()
-- [ ] `model/init.py` — weight init with depth scaling
-- [ ] `tokenizer/tokenizer.py` — byte-level BPE from scratch
-- [ ] `data/prepare.py` — download + tokenize + split
-- [ ] `train.py` — full training loop with CLI args
-- [ ] `export.py` — SUBA binary weight export
-- [ ] `inference.py` — prompt → generated text
+### Phase 1 — C Engine
+- [ ] `engine/loader.c` + `engine/loader.h`
+- [ ] `engine/matmul.c` + `engine/matmul.h`
+- [ ] `engine/kvcache.c` + `engine/kvcache.h`
+- [ ] `engine/model.c` + `engine/model.h`
+- [ ] `engine/sampler.c` + `engine/sampler.h`
+- [ ] `engine/tokenizer.c` + `engine/tokenizer.h`
+- [ ] `engine/inference.c`
+- [ ] `engine/Makefile`
+
+### Phase 2 — Architecture
+- [ ] `model/config.py`
+- [ ] `model/architecture.py`
+- [ ] `model/init.py`
+
+### Phase 3–6
+- [ ] `tokenizer/tokenizer.py`
+- [ ] `data/prepare.py`
+- [ ] `train.py`
+- [ ] `export.py`
 - [ ] `requirements.txt`
+
+### Done
+- [ ] End-to-end test passes
 - [ ] All files committed to `main`
 - [ ] `ai-prompt.md` **deleted** as the final commit
