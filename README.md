@@ -1,28 +1,35 @@
 # SUB-AI
 
-> A from-scratch AI language model — custom architecture, custom weights, no pretrained models.
+> A language model built entirely from scratch — custom architecture, custom weights, trained from zero. No pretrained models. No Hugging Face.
 
 ![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-in%20development-yellow)
-![Language](https://img.shields.io/badge/language-Python%20%7C%20C-lightgrey)
+![Language](https://img.shields.io/badge/language-Python%20%7C%20PyTorch-orange)
 
 ---
 
 ## What is SUB-AI?
 
-SUB-AI is a fully hand-crafted language model built under the **SUB** brand. The entire architecture — embeddings, attention blocks, feedforward layers, weight initialization, and training loop — is written from scratch. No Hugging Face weights. No pretrained checkpoints. Every tensor starts as a random number and is trained on raw text data.
+SUB-AI is a fully hand-crafted language model built under the **SUB** brand by [Subhadip](https://subhobhai943.xyz). Every component is written from scratch:
 
-This is the training-side counterpart to the **SUB LLM inference engine** (C-based), which already implements Q8_0 quantization, a KV-cache, a streaming token callback, and a full inference manager.
+- **Architecture** — custom decoder-only Transformer (no `transformers` library)
+- **Weights** — randomly initialized, trained from zero on raw text
+- **Tokenizer** — byte-level BPE implemented from scratch
+- **Training loop** — AdamW + cosine LR scheduler, written manually
+- **Inference** — pure Python sampling loop (no external inference engines)
+
+This is Phase 1 of a larger vision: once the model trains successfully, a future **SUB C inference engine** will run the exported weights natively — but that comes later.
 
 ---
 
 ## Goals
 
-- Design a custom Transformer-based architecture with original hyperparameters
-- Initialize all weights from scratch (Kaiming / custom schemes)
-- Train on a curated text corpus using PyTorch
-- Export weights to a binary format compatible with the SUB C inference engine
-- Run quantized inference natively inside the SUB OS ecosystem
+- Design a custom Transformer architecture with original hyperparameters
+- Initialize all weights from scratch using proper init schemes
+- Train on a curated text corpus using PyTorch on Google Colab (T4 GPU)
+- Save and resume training checkpoints
+- Export trained weights to a flat binary format for future C engine integration
+- Demonstrate that a real LLM can be built without any pretrained model
 
 ---
 
@@ -31,17 +38,18 @@ This is the training-side counterpart to the **SUB LLM inference engine** (C-bas
 ```
 SUB-AI/
 ├── model/
-│   ├── architecture.py   # Transformer blocks, attention, MLP
-│   ├── config.py         # Hyperparameter configs
-│   └── init.py           # Custom weight initialization
+│   ├── architecture.py   # Transformer blocks, attention, MLP, full model
+│   ├── config.py         # SUBConfig dataclass with hyperparameter presets
+│   └── init.py           # Custom weight initialization scheme
 ├── tokenizer/
-│   └── tokenizer.py      # Byte-level or custom BPE tokenizer
+│   └── tokenizer.py      # Byte-level BPE tokenizer (train/encode/decode/save/load)
 ├── data/
-│   └── prepare.py        # Dataset downloading and preprocessing
-├── train.py              # Main training loop (PyTorch)
-├── export.py             # Export weights → SUB binary format
-├── inference.py          # Quick inference test (pure Python)
+│   └── prepare.py        # Dataset download, tokenize, train/val split
+├── train.py              # Main training loop (AdamW, cosine LR, checkpointing)
+├── export.py             # Export trained weights to SUB binary format (.bin)
+├── inference.py          # Python inference: load checkpoint, generate text
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -51,24 +59,31 @@ SUB-AI/
 
 - [ ] Phase 1 — Architecture design (`model/architecture.py`)
 - [ ] Phase 2 — Custom weight initialization (`model/init.py`)
-- [ ] Phase 3 — Byte-level tokenizer (`tokenizer/tokenizer.py`)
-- [ ] Phase 4 — Dataset prep script (`data/prepare.py`)
-- [ ] Phase 5 — Training loop with AdamW + LR scheduler (`train.py`)
-- [ ] Phase 6 — Checkpoint saving / resuming
-- [ ] Phase 7 — Weight export to SUB binary format (`export.py`)
-- [ ] Phase 8 — Integration test with SUB C inference engine
-- [ ] Phase 9 — Scale up: larger model, more data
+- [ ] Phase 3 — Byte-level BPE tokenizer (`tokenizer/tokenizer.py`)
+- [ ] Phase 4 — Dataset prep: download + tokenize + split (`data/prepare.py`)
+- [ ] Phase 5 — Training loop with AdamW + cosine LR scheduler (`train.py`)
+- [ ] Phase 6 — Checkpoint saving and resuming
+- [ ] Phase 7 — Weight export to binary format (`export.py`)
+- [ ] Phase 8 — Python inference test (`inference.py`)
+- [ ] Phase 9 — Scale up: larger model, bigger dataset
+- [ ] Phase 10 — *(Future)* Build SUB C inference engine to run exported weights natively
 
 ---
 
-## Tech Stack
+## Default Hyperparameters (~10M params)
 
-| Layer | Tool |
+| Parameter | Value |
 |---|---|
-| Architecture & Training | Python + PyTorch |
-| Inference (production) | C (SUB engine) |
-| Quantization | Q8_0 (int8 + per-row scale) |
-| Target hardware | Colab T4 GPU / CUDA |
+| Vocabulary size | 8,000 |
+| Context length | 512 tokens |
+| Embedding dimension | 256 |
+| Attention heads | 8 (head dim = 32) |
+| Transformer layers | 6 |
+| FFN multiplier | 4× |
+| Dropout | 0.1 |
+| Optimizer | AdamW |
+| Learning rate | 6e-4 (cosine decay) |
+| Target hardware | Google Colab T4 GPU |
 
 ---
 
