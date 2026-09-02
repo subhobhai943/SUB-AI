@@ -2,11 +2,14 @@
 tokenizer.py — Byte-Level Byte-Pair Encoding (BPE) Tokenizer from scratch.
 
 Provides ByteLevelBPETokenizer without external dependencies.
-Trains merges from raw text, encodes strings to token IDs, decodes IDs to text,
-and saves/loads JSON format compatible with both Python and the C engine.
+Trains merges from raw text using word-frequency optimization, encodes strings
+to token IDs, decodes IDs to text, and saves/loads JSON format compatible with
+both Python and the C engine.
 """
 
+import collections
 import json
+import re
 from typing import Dict, List, Tuple
 
 
@@ -25,31 +28,36 @@ class ByteLevelBPETokenizer:
         self.merges: List[Tuple[int, int]] = []
         self.bpe_ranks: Dict[Tuple[int, int], int] = {}
 
-    def _get_pair_counts(self, token_list: List[int]) -> Dict[Tuple[int, int], int]:
-        counts: Dict[Tuple[int, int], int] = {}
-        for i in range(len(token_list) - 1):
-            pair = (token_list[i], token_list[i + 1])
-            counts[pair] = counts.get(pair, 0) + 1
-        return counts
-
-    def train(self, text: str, vocab_size: int = None, verbose: bool = False):
+    def train(self, text: str, vocab_size: int = None, verbose: bool = True):
         """
         Train BPE tokenizer on text until target vocab_size is reached.
+        Uses chunk/word frequency dictionary for high-performance training.
         """
         if vocab_size is not None:
             self.vocab_size = vocab_size
 
-        tokens = list(text.encode("utf-8"))
         self.vocab = {i: bytes([i]) for i in range(256)}
         self.merges = []
         self.bpe_ranks = {}
 
         num_merges_target = self.vocab_size - 256
+        if num_merges_target <= 0:
+            return
+
+        # Split text into chunks (words and whitespace blocks) to accelerate pair counting
+        chunks = re.findall(r"\S+|\s+", text)
+        word_freqs = collections.Counter(tuple(chunk.encode("utf-8")) for chunk in chunks)
+
         if verbose:
-            print(f"Training tokenizer on {len(tokens)} bytes. Target merges: {num_merges_target}")
+            print(f"Training tokenizer on {len(text)} chars ({len(word_freqs)} unique chunks). Target merges: {num_merges_target}")
 
         for merge_idx in range(num_merges_target):
-            pair_counts = self._get_pair_counts(tokens)
+            # Count pair frequencies across weighted unique chunks
+            pair_counts: Dict[Tuple[int, int], int] = collections.defaultdict(int)
+            for word, freq in word_freqs.items():
+                for i in range(len(word) - 1):
+                    pair_counts[(word[i], word[i + 1])] += freq
+
             if not pair_counts:
                 break
 
@@ -62,40 +70,39 @@ class ByteLevelBPETokenizer:
             self.bpe_ranks[best_pair] = merge_idx
             self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
 
-            # Apply merge across tokens
-            new_tokens: List[int] = []
-            i = 0
-            n = len(tokens)
             p0, p1 = best_pair
-            while i < n:
-                if i < n - 1 and tokens[i] == p0 and tokens[i + 1] == p1:
-                    new_tokens.append(new_id)
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
-                    i += 1
-            tokens = new_tokens
+            new_word_freqs = {}
+            for word, freq in word_freqs.items():
+                if p0 not in word or p1 not in word:
+                    new_word_freqs[word] = freq
+                    continue
 
-            if verbose and (merge_idx + 1) % 500 == 0:
-                print(f"Merge {merge_idx + 1}/{num_merges_target}: {best_pair} -> {new_id} ({self.vocab[new_id]!r})")
+                new_word = []
+                i = 0
+                n = len(word)
+                while i < n:
+                    if i < n - 1 and word[i] == p0 and word[i + 1] == p1:
+                        new_word.append(new_id)
+                        i += 2
+                    else:
+                        new_word.append(word[i])
+                        i += 1
+                new_word_freqs[tuple(new_word)] = freq
+            word_freqs = new_word_freqs
+
+            if verbose and (merge_idx + 1) % 1000 == 0:
+                print(f"Merge {merge_idx + 1}/{num_merges_target}: {best_pair} -> {new_id}")
 
         self.vocab_size = len(self.vocab)
         if verbose:
             print(f"Tokenizer training complete. Final vocab size: {self.vocab_size}")
 
-    def encode(self, text: str) -> List[int]:
-        """
-        Encode string to list of token IDs using learned BPE merges.
-        """
-        if not text:
-            return []
-
-        tokens = list(text.encode("utf-8"))
+    def _encode_chunk(self, chunk_bytes: Tuple[int, ...]) -> List[int]:
+        tokens = list(chunk_bytes)
         if len(tokens) < 2:
             return tokens
 
         while len(tokens) >= 2:
-            # Find the pair with the lowest merge rank
             best_pair = None
             best_rank = float("inf")
 
@@ -112,7 +119,7 @@ class ByteLevelBPETokenizer:
             new_id = 256 + self.bpe_ranks[best_pair]
             p0, p1 = best_pair
 
-            new_tokens: List[int] = []
+            new_tokens = []
             i = 0
             n = len(tokens)
             while i < n:
@@ -125,6 +132,28 @@ class ByteLevelBPETokenizer:
             tokens = new_tokens
 
         return tokens
+
+    def encode(self, text: str) -> List[int]:
+        """
+        Encode string to list of token IDs using learned BPE merges.
+        """
+        if not text:
+            return []
+
+        chunks = re.findall(r"\S+|\s+", text)
+        result = []
+        cache: Dict[bytes, List[int]] = {}
+
+        for chunk in chunks:
+            raw = chunk.encode("utf-8")
+            if raw in cache:
+                result.extend(cache[raw])
+            else:
+                encoded = self._encode_chunk(tuple(raw))
+                cache[raw] = encoded
+                result.extend(encoded)
+
+        return result
 
     def decode(self, ids: List[int]) -> str:
         """
