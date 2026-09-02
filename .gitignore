@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Build and binary artifacts
+*.o
+engine/inference
+model.bin
+
+# Checkpoints
+checkpoints/
+
+# Data cache (keep tokenizer.json if desired, ignore raw and tokenized npy)
+data/*.npy
+data/input.txt

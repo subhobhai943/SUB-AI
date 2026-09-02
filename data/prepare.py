@@ -7,9 +7,14 @@ and 10% validation sets, and saves them as data/train.npy and data/val.npy (uint
 """
 
 import os
+import sys
 import argparse
 import requests
 import numpy as np
+
+# Ensure project root is on sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from tokenizer.tokenizer import ByteLevelBPETokenizer
 
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"

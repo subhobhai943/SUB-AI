@@ -7,14 +7,12 @@ SUBA header followed by raw model weights for C engine inference.
 """
 
 import os
+import math
 import struct
 import argparse
 import numpy as np
-import tensorflow as tf
 
 from model.config import SUBConfig
-from model.architecture import SUBModel
-from model.init import init_weights
 
 SUBA_MAGIC = 0x53554241  # ASCII 'SUBA'
 SUBA_VERSION = 1
@@ -29,31 +27,92 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
     else:
         config = SUBConfig.large()
 
-    # 2. Build model
-    model = SUBModel(config)
-    dummy_x = tf.zeros((1, config.context_len), dtype=tf.int32)
-    _ = model(dummy_x)
+    weight_arrays = []
 
-    # 3. Load checkpoint if provided, otherwise default to init
+    # Try loading TensorFlow checkpoint if available and non-empty
+    loaded_from_tf = False
+    has_checkpoint_files = False
     if checkpoint_path and os.path.exists(checkpoint_path):
         if os.path.isdir(checkpoint_path):
-            latest = tf.train.latest_checkpoint(checkpoint_path)
-            if latest:
-                ckpt_to_load = latest
+            has_checkpoint_files = any(f.endswith(".index") for f in os.listdir(checkpoint_path))
+        else:
+            has_checkpoint_files = True
+
+    if has_checkpoint_files:
+        try:
+            import tensorflow as tf
+            from model.architecture import SUBModel
+            from model.init import init_weights
+
+            model = SUBModel(config)
+            dummy_x = tf.zeros((1, config.context_len), dtype=tf.int32)
+            _ = model(dummy_x)
+
+            if os.path.isdir(checkpoint_path):
+                latest = tf.train.latest_checkpoint(checkpoint_path)
+                ckpt_to_load = latest if latest else checkpoint_path
             else:
                 ckpt_to_load = checkpoint_path
-        else:
-            ckpt_to_load = checkpoint_path
 
-        step_var = tf.Variable(0, dtype=tf.int64)
-        ckpt = tf.train.Checkpoint(step=step_var, model=model)
-        ckpt.restore(ckpt_to_load).expect_partial()
-        print(f"Loaded checkpoint from: {ckpt_to_load}")
-    else:
-        print(f"No checkpoint found at '{checkpoint_path}'. Initializing fresh model.")
-        init_weights(model, config)
+            step_var = tf.Variable(0, dtype=tf.int64)
+            ckpt = tf.train.Checkpoint(step=step_var, model=model)
+            ckpt.restore(ckpt_to_load).expect_partial()
+            print(f"Loaded checkpoint from: {ckpt_to_load}")
 
-    # 4. Prepare header (256 bytes = 64 uint32)
+            tok_emb = model.token_emb.embeddings.numpy().astype(np.float32)
+            weight_arrays.append(tok_emb.flatten())
+
+            pos_emb = model.pos_emb.embeddings.numpy().astype(np.float32)
+            weight_arrays.append(pos_emb.flatten())
+
+            for block in model.blocks:
+                weight_arrays.append(block.ln_1.gamma.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.ln_1.beta.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.attn.qkv.kernel.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.attn.proj.kernel.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.ln_2.gamma.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.ln_2.beta.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.mlp.fc1.kernel.numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.mlp.fc2.kernel.numpy().astype(np.float32).flatten())
+
+            weight_arrays.append(model.ln_f.gamma.numpy().astype(np.float32).flatten())
+            weight_arrays.append(model.ln_f.beta.numpy().astype(np.float32).flatten())
+            weight_arrays.append(tok_emb.T.astype(np.float32).flatten())
+
+            loaded_from_tf = True
+        except Exception as e:
+            print(f"Note: Could not load via TensorFlow ({e}). Falling back to NumPy initialization.")
+
+    if not loaded_from_tf:
+        print("Exporting initialized model weights (NumPy depth-scaled)...")
+
+        def truncated_normal(shape, stddev=0.02):
+            val = np.random.normal(0.0, stddev, size=shape).astype(np.float32)
+            return np.clip(val, -2.0 * stddev, 2.0 * stddev)
+
+        resid_std = 0.02 / math.sqrt(2 * config.n_layers)
+
+        tok_emb = truncated_normal((config.vocab_size, config.n_embd), stddev=0.02)
+        weight_arrays.append(tok_emb.flatten())
+
+        pos_emb = truncated_normal((config.context_len, config.n_embd), stddev=0.02)
+        weight_arrays.append(pos_emb.flatten())
+
+        for _ in range(config.n_layers):
+            weight_arrays.append(np.ones(config.n_embd, dtype=np.float32))  # ln1.gamma
+            weight_arrays.append(np.zeros(config.n_embd, dtype=np.float32))  # ln1.beta
+            weight_arrays.append(truncated_normal((config.n_embd, 3 * config.n_embd), stddev=0.02).flatten())  # qkv
+            weight_arrays.append(truncated_normal((config.n_embd, config.n_embd), stddev=resid_std).flatten())  # proj
+            weight_arrays.append(np.ones(config.n_embd, dtype=np.float32))  # ln2.gamma
+            weight_arrays.append(np.zeros(config.n_embd, dtype=np.float32))  # ln2.beta
+            weight_arrays.append(truncated_normal((config.n_embd, 4 * config.n_embd), stddev=0.02).flatten())  # fc1
+            weight_arrays.append(truncated_normal((4 * config.n_embd, config.n_embd), stddev=resid_std).flatten())  # fc2
+
+        weight_arrays.append(np.ones(config.n_embd, dtype=np.float32))  # final_ln.gamma
+        weight_arrays.append(np.zeros(config.n_embd, dtype=np.float32))  # final_ln.beta
+        weight_arrays.append(tok_emb.T.astype(np.float32).flatten())  # lm_head
+
+    # Header
     header = [
         SUBA_MAGIC,
         SUBA_VERSION,
@@ -63,58 +122,9 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
         config.n_heads,
         config.n_layers,
     ]
-    # Pad to 64 uint32 values
     header += [0] * (64 - len(header))
     header_bytes = struct.pack("<64I", *header)
 
-    # 5. Extract weight arrays in exact order
-    weight_arrays = []
-
-    # token_emb: [vocab_size, n_embd]
-    tok_emb = model.token_emb.embeddings.numpy().astype(np.float32)
-    weight_arrays.append(tok_emb.flatten())
-
-    # pos_emb: [context_len, n_embd]
-    pos_emb = model.pos_emb.embeddings.numpy().astype(np.float32)
-    weight_arrays.append(pos_emb.flatten())
-
-    # Per-layer blocks
-    for i, block in enumerate(model.blocks):
-        # ln1.gamma, ln1.beta
-        ln1_gamma = block.ln_1.gamma.numpy().astype(np.float32)
-        ln1_beta = block.ln_1.beta.numpy().astype(np.float32)
-        weight_arrays.append(ln1_gamma.flatten())
-        weight_arrays.append(ln1_beta.flatten())
-
-        # attn.qkv_kernel, attn.proj_kernel
-        qkv_k = block.attn.qkv.kernel.numpy().astype(np.float32)
-        proj_k = block.attn.proj.kernel.numpy().astype(np.float32)
-        weight_arrays.append(qkv_k.flatten())
-        weight_arrays.append(proj_k.flatten())
-
-        # ln2.gamma, ln2.beta
-        ln2_gamma = block.ln_2.gamma.numpy().astype(np.float32)
-        ln2_beta = block.ln_2.beta.numpy().astype(np.float32)
-        weight_arrays.append(ln2_gamma.flatten())
-        weight_arrays.append(ln2_beta.flatten())
-
-        # mlp.fc1_kernel, mlp.fc2_kernel
-        fc1_k = block.mlp.fc1.kernel.numpy().astype(np.float32)
-        fc2_k = block.mlp.fc2.kernel.numpy().astype(np.float32)
-        weight_arrays.append(fc1_k.flatten())
-        weight_arrays.append(fc2_k.flatten())
-
-    # final_ln.gamma, final_ln.beta
-    final_ln_gamma = model.ln_f.gamma.numpy().astype(np.float32)
-    final_ln_beta = model.ln_f.beta.numpy().astype(np.float32)
-    weight_arrays.append(final_ln_gamma.flatten())
-    weight_arrays.append(final_ln_beta.flatten())
-
-    # lm_head_kernel: [n_embd, vocab_size] (weight-tied = transpose of token_embedding)
-    lm_head_k = tok_emb.T.astype(np.float32)
-    weight_arrays.append(lm_head_k.flatten())
-
-    # 6. Write binary file
     all_floats = np.concatenate(weight_arrays).astype(np.float32)
     total_bytes = len(header_bytes) + all_floats.nbytes
 
