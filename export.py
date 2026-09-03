@@ -50,7 +50,7 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
             from model.architecture import SUBModel
 
             print(f"Loading checkpoint from: {target_ckpt}")
-            ckpt = torch.load(target_ckpt, map_location="cpu")
+            ckpt = torch.load(target_ckpt, map_location="cpu", weights_only=False)
 
             model = SUBModel(config)
             state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt

@@ -160,7 +160,7 @@ def main():
 
     if args.resume and os.path.exists(latest_ckpt_path):
         print(f"Resuming from {latest_ckpt_path}...")
-        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])

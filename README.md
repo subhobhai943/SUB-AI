@@ -146,7 +146,7 @@ python export.py --checkpoint checkpoints/latest.pt --out model.bin --config sma
 
 ### 5. Run Low-Level C Inference
 ```powershell
-.\engine\inference.exe model.bin data/tokenizer.json "Once upon a time"
+.\engine\inference.exe --model model.bin --tokenizer data/tokenizer.json --prompt "Once upon a time"
 ```
 
 ---
