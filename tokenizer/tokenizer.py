@@ -1,16 +1,19 @@
 """
-tokenizer.py — Byte-Level Byte-Pair Encoding (BPE) Tokenizer from scratch.
+tokenizer.py — Byte-Level Byte-Pair Encoding (BPE) Tokenizer with space-aware pre-tokenization.
 
 Provides ByteLevelBPETokenizer without external dependencies.
-Trains merges from raw text using word-frequency optimization, encodes strings
-to token IDs, decodes IDs to text, and saves/loads JSON format compatible with
-both Python and the C engine.
+Trains merges from raw text using word-frequency optimization with whitespace preservation,
+encodes strings to token IDs, decodes IDs to text, and saves/loads JSON format compatible
+with both Python and the C engine.
 """
 
 import collections
 import json
 import re
 from typing import Dict, List, Tuple
+
+# Pre-tokenization regex: preserves whitespace prefixes on words and isolates punctuation
+PRE_TOKENIZE_REGEX = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\w+|[^\w\s]|\s+""")
 
 
 class ByteLevelBPETokenizer:
@@ -19,7 +22,7 @@ class ByteLevelBPETokenizer:
 
     Initial vocabulary is 256 byte values (0-255). Additional tokens
     (256 to vocab_size - 1) are iteratively constructed by finding and merging
-    the most frequent adjacent token pairs.
+    the most frequent adjacent token pairs within word boundaries.
     """
 
     def __init__(self, vocab_size: int = 8000):
@@ -31,7 +34,7 @@ class ByteLevelBPETokenizer:
     def train(self, text: str, vocab_size: int = None, verbose: bool = True):
         """
         Train BPE tokenizer on text until target vocab_size is reached.
-        Uses chunk/word frequency dictionary for high-performance training.
+        Uses word/chunk frequency dictionary for fast pair counting.
         """
         if vocab_size is not None:
             self.vocab_size = vocab_size
@@ -44,15 +47,14 @@ class ByteLevelBPETokenizer:
         if num_merges_target <= 0:
             return
 
-        # Split text into chunks (words and whitespace blocks) to accelerate pair counting
-        chunks = re.findall(r"\S+|\s+", text)
-        word_freqs = collections.Counter(tuple(chunk.encode("utf-8")) for chunk in chunks)
+        # Split text into space-prefixed word chunks
+        chunks = PRE_TOKENIZE_REGEX.findall(text)
+        word_freqs = collections.Counter(tuple(chunk.encode("utf-8")) for chunk in chunks if chunk)
 
         if verbose:
-            print(f"Training tokenizer on {len(text)} chars ({len(word_freqs)} unique chunks). Target merges: {num_merges_target}")
+            print(f"Training tokenizer on {len(text):,} chars ({len(word_freqs):,} unique chunks). Target merges: {num_merges_target}")
 
         for merge_idx in range(num_merges_target):
-            # Count pair frequencies across weighted unique chunks
             pair_counts: Dict[Tuple[int, int], int] = collections.defaultdict(int)
             for word, freq in word_freqs.items():
                 for i in range(len(word) - 1):
@@ -140,7 +142,7 @@ class ByteLevelBPETokenizer:
         if not text:
             return []
 
-        chunks = re.findall(r"\S+|\s+", text)
+        chunks = PRE_TOKENIZE_REGEX.findall(text)
         result = []
         cache: Dict[bytes, List[int]] = {}
 
