@@ -1,9 +1,9 @@
 """
-train.py — TensorFlow training pipeline for SUB-AI Transformer.
+train.py — PyTorch training pipeline for SUB-AI Transformer.
 
-Trains the SUBModel using custom tf.GradientTape loop, Adam optimizer with
-warmup cosine learning rate schedule, gradient clipping, evaluation, and
-robust checkpointing via tf.train.CheckpointManager.
+Trains the SUBModel using GPU acceleration (NVIDIA RTX 3050), AdamW optimizer with
+warmup cosine learning rate schedule, gradient clipping, automatic mixed precision (AMP),
+evaluation, and robust checkpointing compatible with the SUBA C inference engine.
 """
 
 import os
@@ -11,72 +11,72 @@ import time
 import math
 import argparse
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 
 from model.config import SUBConfig
 from model.architecture import SUBModel
 from model.init import init_weights
 
 
-class WarmupCosineDecaySchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+def get_lr_schedule(optimizer, max_lr: float, total_steps: int, warmup_steps: int = 100, min_lr: float = None):
     """
-    Cosine decay learning rate schedule with linear warmup.
+    Returns a Cosine decay learning rate scheduler with linear warmup.
     """
+    if min_lr is None:
+        min_lr = max_lr / 10.0
 
-    def __init__(self, max_lr: float, total_steps: int, warmup_steps: int = 100, min_lr: float = None):
-        super().__init__()
-        self.max_lr = float(max_lr)
-        self.total_steps = float(total_steps)
-        self.warmup_steps = float(warmup_steps)
-        self.min_lr = float(min_lr if min_lr is not None else max_lr / 10.0)
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scaled between min_lr/max_lr and 1.0
+        min_ratio = min_lr / max_lr
+        return min_ratio + (1.0 - min_ratio) * cosine_decay
 
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        warmup_lr = self.max_lr * (step / tf.maximum(self.warmup_steps, 1.0))
-
-        progress = (step - self.warmup_steps) / tf.maximum(self.total_steps - self.warmup_steps, 1.0)
-        progress = tf.clip_by_value(progress, 0.0, 1.0)
-        cosine_lr = self.min_lr + 0.5 * (self.max_lr - self.min_lr) * (1.0 + tf.cos(math.pi * progress))
-
-        return tf.where(step < self.warmup_steps, warmup_lr, cosine_lr)
-
-    def get_config(self):
-        return {
-            "max_lr": self.max_lr,
-            "total_steps": self.total_steps,
-            "warmup_steps": self.warmup_steps,
-            "min_lr": self.min_lr,
-        }
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def get_batch(data: np.ndarray, batch_size: int, context_len: int):
+def get_batch(data: np.ndarray, batch_size: int, context_len: int, device: torch.device):
     """
-    Sample random batch of sequences (x, y) from data array.
+    Sample a random batch of sequences (x, y) from numpy data array.
     """
     max_idx = len(data) - context_len - 1
     ix = np.random.randint(0, max_idx, size=(batch_size,))
-    x = np.stack([data[i : i + context_len] for i in ix]).astype(np.int32)
-    y = np.stack([data[i + 1 : i + 1 + context_len] for i in ix]).astype(np.int32)
-    return tf.constant(x, dtype=tf.int32), tf.constant(y, dtype=tf.int32)
+    x_np = np.stack([data[i : i + context_len] for i in ix]).astype(np.int64)
+    y_np = np.stack([data[i + 1 : i + 1 + context_len] for i in ix]).astype(np.int64)
+    x = torch.from_numpy(x_np).to(device, non_blocking=True)
+    y = torch.from_numpy(y_np).to(device, non_blocking=True)
+    return x, y
 
 
-def evaluate(model: SUBModel, val_data: np.ndarray, batch_size: int, context_len: int, eval_batches: int = 20):
+@torch.no_grad()
+def evaluate(
+    model: SUBModel,
+    val_data: np.ndarray,
+    batch_size: int,
+    context_len: int,
+    device: torch.device,
+    eval_batches: int = 20,
+) -> float:
     """
     Compute average validation loss across several random batches.
     """
+    model.eval()
     losses = []
     for _ in range(eval_batches):
-        x, y = get_batch(val_data, batch_size, context_len)
-        logits = model(x, training=False)
-        loss = tf.reduce_mean(
-            tf.keras.losses.sparse_categorical_crossentropy(y, logits, from_logits=True)
-        )
-        losses.append(loss.numpy())
+        x, y = get_batch(val_data, batch_size, context_len, device)
+        _, loss = model(x, targets=y)
+        losses.append(loss.item())
+    model.train()
     return float(np.mean(losses))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SUB-AI Transformer model in TensorFlow")
+    parser = argparse.ArgumentParser(description="Train SUB-AI Transformer model in PyTorch (GPU accelerated)")
     parser.add_argument("--data_dir", type=str, default="data", help="Directory containing train.npy and val.npy")
     parser.add_argument("--config", type=str, default="small", choices=["small", "medium", "large"], help="Config preset")
     parser.add_argument("--steps", type=int, default=1000, help="Total training steps")
@@ -88,9 +88,25 @@ def main():
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval in steps")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--no_amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
     args = parser.parse_args()
 
-    # 1. Load Data
+    # 1. Hardware & Device Selection
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        device_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"\n[GPU Detected] Using {device_name} ({vram_gb:.2f} GB VRAM)")
+        # Enable Ampere Tensor Core optimizations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        use_amp = not args.no_amp
+    else:
+        device = torch.device("cpu")
+        print("\n[CPU Mode] No CUDA GPU detected, falling back to CPU.")
+        use_amp = False
+
+    # 2. Load Data
     train_path = os.path.join(args.data_dir, "train.npy")
     val_path = os.path.join(args.data_dir, "val.npy")
 
@@ -103,7 +119,7 @@ def main():
     val_data = np.load(val_path)
     print(f"Loaded dataset: {len(train_data):,} train tokens, {len(val_data):,} val tokens")
 
-    # 2. Config & Model
+    # 3. Model & Configuration
     if args.config == "small":
         config = SUBConfig.small()
     elif args.config == "medium":
@@ -114,86 +130,110 @@ def main():
     print(f"Model config: {args.config} (embd={config.n_embd}, heads={config.n_heads}, layers={config.n_layers}, ctx={config.context_len})")
 
     model = SUBModel(config)
-    # Build model by passing a dummy batch
-    dummy_x = tf.zeros((1, config.context_len), dtype=tf.int32)
-    _ = model(dummy_x)
-
-    # Initialize weights with depth scaling
     init_weights(model, config)
-    print(f"Initialized {len(model.trainable_variables)} trainable variables with depth scaling.")
+    model.to(device)
 
-    # 3. Optimizer & LR Schedule
-    lr_schedule = WarmupCosineDecaySchedule(
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Initialized SUBModel with {total_params:,} parameters.")
+
+    # 4. Optimizer & Schedulers
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.1,
+    )
+    scheduler = get_lr_schedule(
+        optimizer,
         max_lr=args.lr,
         total_steps=args.steps,
         warmup_steps=args.warmup_steps,
         min_lr=args.lr / 10.0,
     )
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=lr_schedule,
-        beta_1=0.9,
-        beta_2=0.95,
-        epsilon=1e-8,
-    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # 4. Checkpoints
+    # 5. Checkpoint Restore
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    step_var = tf.Variable(0, dtype=tf.int64)
-    checkpoint = tf.train.Checkpoint(step=step_var, optimizer=optimizer, model=model)
-    manager = tf.train.CheckpointManager(checkpoint, args.checkpoint_dir, max_to_keep=5)
-
+    latest_ckpt_path = os.path.join(args.checkpoint_dir, "latest.pt")
     start_step = 0
-    if args.resume and manager.latest_checkpoint:
-        checkpoint.restore(manager.latest_checkpoint)
-        start_step = int(step_var.numpy())
-        print(f"Resumed from {manager.latest_checkpoint} at step {start_step}")
 
-    # 5. Training Step (compiled with tf.function)
-    @tf.function
-    def train_step(x, y):
-        with tf.GradientTape() as tape:
-            logits = model(x, training=True)
-            loss = tf.reduce_mean(
-                tf.keras.losses.sparse_categorical_crossentropy(y, logits, from_logits=True)
-            )
-        grads = tape.gradient(loss, model.trainable_variables)
-        grads, _ = tf.clip_by_global_norm(grads, 1.0)
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        return loss
+    if args.resume and os.path.exists(latest_ckpt_path):
+        print(f"Resuming from {latest_ckpt_path}...")
+        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_step = ckpt.get("step", 0)
+        print(f"Successfully resumed at step {start_step}")
 
     # 6. Training Loop
-    print(f"\nStarting training for {args.steps} steps...")
+    print(f"\nStarting training for {args.steps} steps (AMP: {'ON' if use_amp else 'OFF'})...")
     t0 = time.time()
     accum_loss = 0.0
     log_count = 0
 
+    model.train()
     for step in range(start_step, args.steps):
-        x_batch, y_batch = get_batch(train_data, args.batch_size, config.context_len)
-        step_loss = train_step(x_batch, y_batch)
-        accum_loss += float(step_loss.numpy())
-        log_count += 1
-        step_var.assign(step + 1)
+        x_batch, y_batch = get_batch(train_data, args.batch_size, config.context_len, device)
 
-        # Log training loss
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=use_amp, dtype=torch.float16):
+            _, loss = model(x_batch, targets=y_batch)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        accum_loss += loss.item()
+        log_count += 1
+
+        # Periodic logging
         if (step + 1) % args.log_interval == 0 or (step + 1) == args.steps:
             avg_train_loss = accum_loss / log_count
-            current_lr = lr_schedule(tf.constant(step, dtype=tf.float32)).numpy()
+            current_lr = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - t0
             tok_per_sec = (log_count * args.batch_size * config.context_len) / max(elapsed, 1e-6)
-            print(f"Step {step + 1:5d}/{args.steps:5d} | Train Loss: {avg_train_loss:.4f} | LR: {current_lr:.2e} | Speed: {tok_per_sec:.0f} tok/s")
+            print(
+                f"Step {step + 1:5d}/{args.steps:5d} | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Speed: {tok_per_sec:,.0f} tok/s"
+            )
             accum_loss = 0.0
             log_count = 0
             t0 = time.time()
 
-        # Evaluate validation loss
+        # Periodic evaluation
         if (step + 1) % args.eval_interval == 0 or (step + 1) == args.steps:
-            val_loss = evaluate(model, val_data, args.batch_size, config.context_len)
+            val_loss = evaluate(model, val_data, args.batch_size, config.context_len, device)
             print(f"  --> Evaluation @ Step {step + 1}: Val Loss = {val_loss:.4f}")
 
-        # Save checkpoint
+        # Periodic checkpointing
         if (step + 1) % args.save_interval == 0 or (step + 1) == args.steps:
-            save_path = manager.save()
-            print(f"  --> Checkpoint saved: {save_path}")
+            ckpt_dict = {
+                "step": step + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": {
+                    "vocab_size": config.vocab_size,
+                    "context_len": config.context_len,
+                    "n_embd": config.n_embd,
+                    "n_heads": config.n_heads,
+                    "n_layers": config.n_layers,
+                    "preset": args.config,
+                },
+                "loss": loss.item(),
+            }
+            step_ckpt = os.path.join(args.checkpoint_dir, f"sub_ai_step_{step + 1}.pt")
+            torch.save(ckpt_dict, step_ckpt)
+            torch.save(ckpt_dict, latest_ckpt_path)
+            print(f"  --> Checkpoint saved: {step_ckpt}")
 
     print("\nTraining completed successfully.")
 

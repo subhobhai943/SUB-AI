@@ -2,57 +2,60 @@
 init.py — Custom weight initialization for SUB-AI Transformer.
 
 Applies GPT-2 style depth-scaled truncated normal initialization
-to all model weights using TensorFlow initializers.
+to all model weights using PyTorch initializers.
 """
 
 import math
-import tensorflow as tf
+import torch
+import torch.nn as nn
 from model.config import SUBConfig
 
 
-def init_weights(model: tf.keras.Model, config: SUBConfig):
+def init_weights(model: nn.Module, config: SUBConfig):
     """
-    Initializes all trainable variables of the SUBModel according to the specification:
-      - Embedding + standard linear kernels: TruncatedNormal(stddev=0.02)
-      - Residual projection kernels (proj, fc2): TruncatedNormal(stddev=0.02 / sqrt(2 * n_layers))
-      - LayerNorm gamma: Ones()
-      - LayerNorm beta & biases: Zeros()
+    Initializes all parameters of the SUBModel according to specification:
+      - Embedding + standard linear weights (qkv, fc1): TruncatedNormal(stddev=0.02)
+      - Residual projection weights (proj, fc2): TruncatedNormal(stddev=0.02 / sqrt(2 * n_layers))
+      - LayerNorm weight (gamma): 1.0
+      - LayerNorm bias (beta) & any biases: 0.0
 
     Args:
-        model: An instantiated SUBModel (built by passing a dummy batch).
+        model: An instantiated SUBModel.
         config: The SUBConfig containing n_layers and hyperparameters.
     """
-    # Ensure model is built by doing a forward pass if not already built
-    if not model.built and not model.trainable_variables:
-        dummy_input = tf.zeros((1, config.context_len), dtype=tf.int32)
-        model(dummy_input)
-
-    std_normal = tf.keras.initializers.TruncatedNormal(stddev=0.02)
     resid_std = 0.02 / math.sqrt(2 * config.n_layers)
-    resid_normal = tf.keras.initializers.TruncatedNormal(stddev=resid_std)
-    ones_init = tf.keras.initializers.Ones()
-    zeros_init = tf.keras.initializers.Zeros()
 
-    for var in model.trainable_variables:
-        name = var.name.lower()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
 
-        # LayerNorm parameters
-        if "ln" in name or "layernorm" in name:
-            if "gamma" in name or "scale" in name:
-                var.assign(ones_init(shape=var.shape, dtype=var.dtype))
-            elif "beta" in name or "offset" in name or "bias" in name:
-                var.assign(zeros_init(shape=var.shape, dtype=var.dtype))
-            else:
-                var.assign(ones_init(shape=var.shape, dtype=var.dtype))
-        # Residual projections: attn/proj and mlp/fc2
-        elif "proj" in name or "fc2" in name:
-            if "kernel" in name or "weight" in name:
-                var.assign(resid_normal(shape=var.shape, dtype=var.dtype))
+        # 1. LayerNorm parameters
+        if "ln" in name:
+            if "weight" in name:
+                nn.init.ones_(param)
             elif "bias" in name:
-                var.assign(zeros_init(shape=var.shape, dtype=var.dtype))
-        # Other kernels, embeddings, and weights
-        else:
-            if "bias" in name:
-                var.assign(zeros_init(shape=var.shape, dtype=var.dtype))
-            else:
-                var.assign(std_normal(shape=var.shape, dtype=var.dtype))
+                nn.init.zeros_(param)
+
+        # 2. Residual projections (scaled by 1 / sqrt(2 * n_layers))
+        elif "proj.weight" in name or "fc2.weight" in name:
+            nn.init.trunc_normal_(
+                param,
+                mean=0.0,
+                std=resid_std,
+                a=-2.0 * resid_std,
+                b=2.0 * resid_std,
+            )
+
+        # 3. Embedding and other linear projection weights (qkv, fc1)
+        elif "weight" in name:
+            nn.init.trunc_normal_(
+                param,
+                mean=0.0,
+                std=0.02,
+                a=-0.04,
+                b=0.04,
+            )
+
+        # 4. Any biases
+        elif "bias" in name:
+            nn.init.zeros_(param)

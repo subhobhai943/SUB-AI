@@ -1,9 +1,9 @@
 """
-export.py — Export TensorFlow SUBModel checkpoint to SUBA binary format.
+export.py — Export SUB-AI model checkpoint to SUBA binary format for C engine inference.
 
-Reads model weights from a tf.train.Checkpoint directory or initializes a configured
-model, packs tensors in float32 row-major format, and writes out the standard 256-byte
-SUBA header followed by raw model weights for C engine inference.
+Reads model weights from a PyTorch checkpoint (.pt) or initializes configured weights,
+packs tensors in float32 row-major format matching engine/loader.c and engine/matmul.c,
+and writes out the standard 256-byte SUBA header followed by raw model weights.
 """
 
 import os
@@ -28,62 +28,83 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
         config = SUBConfig.large()
 
     weight_arrays = []
+    loaded_from_pt = False
 
-    # Try loading TensorFlow checkpoint if available and non-empty
-    loaded_from_tf = False
-    has_checkpoint_files = False
+    # Check if checkpoint path exists
+    target_ckpt = None
     if checkpoint_path and os.path.exists(checkpoint_path):
         if os.path.isdir(checkpoint_path):
-            has_checkpoint_files = any(f.endswith(".index") for f in os.listdir(checkpoint_path))
-        else:
-            has_checkpoint_files = True
+            latest = os.path.join(checkpoint_path, "latest.pt")
+            if os.path.exists(latest):
+                target_ckpt = latest
+            else:
+                pts = [os.path.join(checkpoint_path, f) for f in os.listdir(checkpoint_path) if f.endswith(".pt")]
+                if pts:
+                    target_ckpt = sorted(pts)[-1]
+        elif checkpoint_path.endswith(".pt"):
+            target_ckpt = checkpoint_path
 
-    if has_checkpoint_files:
+    if target_ckpt:
         try:
-            import tensorflow as tf
+            import torch
             from model.architecture import SUBModel
-            from model.init import init_weights
+
+            print(f"Loading checkpoint from: {target_ckpt}")
+            ckpt = torch.load(target_ckpt, map_location="cpu")
 
             model = SUBModel(config)
-            dummy_x = tf.zeros((1, config.context_len), dtype=tf.int32)
-            _ = model(dummy_x)
+            state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+            model.load_state_dict(state_dict)
+            model.eval()
 
-            if os.path.isdir(checkpoint_path):
-                latest = tf.train.latest_checkpoint(checkpoint_path)
-                ckpt_to_load = latest if latest else checkpoint_path
-            else:
-                ckpt_to_load = checkpoint_path
-
-            step_var = tf.Variable(0, dtype=tf.int64)
-            ckpt = tf.train.Checkpoint(step=step_var, model=model)
-            ckpt.restore(ckpt_to_load).expect_partial()
-            print(f"Loaded checkpoint from: {ckpt_to_load}")
-
-            tok_emb = model.token_emb.embeddings.numpy().astype(np.float32)
+            # 1. Token embedding: [vocab_size, n_embd]
+            tok_emb = model.token_emb.weight.detach().cpu().numpy().astype(np.float32)
             weight_arrays.append(tok_emb.flatten())
 
-            pos_emb = model.pos_emb.embeddings.numpy().astype(np.float32)
+            # 2. Position embedding: [context_len, n_embd]
+            pos_emb = model.pos_emb.weight.detach().cpu().numpy().astype(np.float32)
             weight_arrays.append(pos_emb.flatten())
 
+            # 3. Transformer blocks
             for block in model.blocks:
-                weight_arrays.append(block.ln_1.gamma.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.ln_1.beta.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.attn.qkv.kernel.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.attn.proj.kernel.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.ln_2.gamma.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.ln_2.beta.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.mlp.fc1.kernel.numpy().astype(np.float32).flatten())
-                weight_arrays.append(block.mlp.fc2.kernel.numpy().astype(np.float32).flatten())
+                # ln1 gamma & beta
+                weight_arrays.append(block.ln_1.weight.detach().cpu().numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.ln_1.bias.detach().cpu().numpy().astype(np.float32).flatten())
 
-            weight_arrays.append(model.ln_f.gamma.numpy().astype(np.float32).flatten())
-            weight_arrays.append(model.ln_f.beta.numpy().astype(np.float32).flatten())
-            weight_arrays.append(tok_emb.T.astype(np.float32).flatten())
+                # qkv weight: PyTorch is [3*n_embd, n_embd] -> transpose to [n_embd, 3*n_embd]
+                qkv_w = block.attn.qkv.weight.detach().cpu().numpy().T.astype(np.float32)
+                weight_arrays.append(qkv_w.flatten())
 
-            loaded_from_tf = True
+                # proj weight: PyTorch is [n_embd, n_embd] -> transpose to [n_embd, n_embd]
+                proj_w = block.attn.proj.weight.detach().cpu().numpy().T.astype(np.float32)
+                weight_arrays.append(proj_w.flatten())
+
+                # ln2 gamma & beta
+                weight_arrays.append(block.ln_2.weight.detach().cpu().numpy().astype(np.float32).flatten())
+                weight_arrays.append(block.ln_2.bias.detach().cpu().numpy().astype(np.float32).flatten())
+
+                # fc1 weight: PyTorch is [4*n_embd, n_embd] -> transpose to [n_embd, 4*n_embd]
+                fc1_w = block.mlp.fc1.weight.detach().cpu().numpy().T.astype(np.float32)
+                weight_arrays.append(fc1_w.flatten())
+
+                # fc2 weight: PyTorch is [n_embd, 4*n_embd] -> transpose to [4*n_embd, n_embd]
+                fc2_w = block.mlp.fc2.weight.detach().cpu().numpy().T.astype(np.float32)
+                weight_arrays.append(fc2_w.flatten())
+
+            # 4. Final LayerNorm gamma & beta
+            weight_arrays.append(model.ln_f.weight.detach().cpu().numpy().astype(np.float32).flatten())
+            weight_arrays.append(model.ln_f.bias.detach().cpu().numpy().astype(np.float32).flatten())
+
+            # 5. LM head (weight-tied with token_emb: x @ token_emb.T -> [n_embd, vocab_size] in C loader)
+            lm_head = tok_emb.T.astype(np.float32)
+            weight_arrays.append(lm_head.flatten())
+
+            loaded_from_pt = True
+            print("Successfully extracted weights from PyTorch checkpoint.")
         except Exception as e:
-            print(f"Note: Could not load via TensorFlow ({e}). Falling back to NumPy initialization.")
+            print(f"Warning: Could not load via PyTorch ({e}). Falling back to NumPy initialization.")
 
-    if not loaded_from_tf:
+    if not loaded_from_pt:
         print("Exporting initialized model weights (NumPy depth-scaled)...")
 
         def truncated_normal(shape, stddev=0.02):
@@ -112,7 +133,7 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
         weight_arrays.append(np.zeros(config.n_embd, dtype=np.float32))  # final_ln.beta
         weight_arrays.append(tok_emb.T.astype(np.float32).flatten())  # lm_head
 
-    # Header
+    # SUBA Binary Header: 64 x uint32 (256 bytes)
     header = [
         SUBA_MAGIC,
         SUBA_VERSION,
@@ -145,8 +166,8 @@ def export_model(checkpoint_path: str, out_path: str, config_preset: str = "smal
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export TensorFlow SUBModel to SUBA .bin format")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints", help="Path to checkpoint file or directory")
+    parser = argparse.ArgumentParser(description="Export SUB-AI model checkpoint to SUBA .bin format")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints", help="Path to .pt checkpoint file or directory")
     parser.add_argument("--out", type=str, default="model.bin", help="Output .bin file path")
     parser.add_argument("--config", type=str, default="small", choices=["small", "medium", "large"], help="Config preset")
     args = parser.parse_args()

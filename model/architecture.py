@@ -1,26 +1,31 @@
 """
-architecture.py — TensorFlow Transformer architecture for SUB-AI.
+architecture.py — PyTorch Transformer architecture for SUB-AI.
 
 Implements CausalSelfAttention, MLP, Transformer Block, and SUBModel
-as tf.keras Layer and Model subclasses matching the exact SUBA tensor layout.
+matching the exact SUBA tensor layout and C engine specifications.
+Supports CUDA acceleration, FlashAttention / SDPA, and AMP (FP16/BF16).
 """
 
 import math
-import numpy as np
-import tensorflow as tf
+from typing import List, Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from model.config import SUBConfig
 
 
-class CausalSelfAttention(tf.keras.layers.Layer):
+class CausalSelfAttention(nn.Module):
     """
     Multi-head causal self-attention layer.
 
-    Projects inputs to Q, K, V with a single Dense kernel, applies scaled dot-product
-    attention with lower-triangular causal masking, and projects back to n_embd.
+    Projects inputs to Q, K, V with a single Linear projection (no bias),
+    computes scaled dot-product attention with causal masking, and projects
+    back to n_embd.
     """
 
-    def __init__(self, config: SUBConfig, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, config: SUBConfig):
+        super().__init__()
         self.n_embd = config.n_embd
         self.n_heads = config.n_heads
         self.head_dim = config.n_embd // config.n_heads
@@ -28,174 +33,185 @@ class CausalSelfAttention(tf.keras.layers.Layer):
 
         assert config.n_embd % config.n_heads == 0, "n_embd must be divisible by n_heads"
 
-        self.qkv = tf.keras.layers.Dense(3 * config.n_embd, use_bias=False, name="qkv")
-        self.proj = tf.keras.layers.Dense(config.n_embd, use_bias=False, name="proj")
-        self.attn_dropout = tf.keras.layers.Dropout(config.dropout)
-        self.resid_dropout = tf.keras.layers.Dropout(config.dropout)
+        # Combined Q, K, V projection: [n_embd -> 3 * n_embd] without bias
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        # Output projection: [n_embd -> n_embd] without bias
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
-    def call(self, x, training=False):
-        B = tf.shape(x)[0]
-        T = tf.shape(x)[1]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.size()
 
-        # [B, T, 3 * n_embd]
+        # 1. Project to QKV: [B, T, 3 * n_embd]
         qkv = self.qkv(x)
 
-        # Split into Q, K, V -> each [B, T, n_embd]
-        q, k, v = tf.split(qkv, 3, axis=-1)
+        # 2. Split into Q, K, V: each [B, T, n_embd]
+        q, k, v = qkv.split(self.n_embd, dim=-1)
 
-        # Reshape to [B, n_heads, T, head_dim]
-        q = tf.transpose(tf.reshape(q, [B, T, self.n_heads, self.head_dim]), [0, 2, 1, 3])
-        k = tf.transpose(tf.reshape(k, [B, T, self.n_heads, self.head_dim]), [0, 2, 1, 3])
-        v = tf.transpose(tf.reshape(v, [B, T, self.n_heads, self.head_dim]), [0, 2, 1, 3])
+        # 3. Reshape into [B, n_heads, T, head_dim]
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention: [B, n_heads, T, T]
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = tf.matmul(q, k, transpose_b=True) * scale
+        # 4. Scaled dot-product attention with causal mask
+        dropout_p = self.dropout_rate if self.training else 0.0
+        # PyTorch F.scaled_dot_product_attention provides fast hardware-accelerated attention
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True
+        )
 
-        # Causal mask: lower triangular matrix
-        causal_mask = tf.linalg.band_part(tf.ones((T, T), dtype=scores.dtype), -1, 0)
-        mask_val = -1e9
-        scores = tf.where(causal_mask == 1.0, scores, mask_val)
+        # 5. Transpose back and concat heads: [B, T, n_embd]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        attn_weights = tf.nn.softmax(scores, axis=-1)
-        attn_weights = self.attn_dropout(attn_weights, training=training)
-
-        # Attend: [B, n_heads, T, head_dim]
-        out = tf.matmul(attn_weights, v)
-
-        # Transpose back and concat heads: [B, T, n_embd]
-        out = tf.transpose(out, [0, 2, 1, 3])
-        out = tf.reshape(out, [B, T, self.n_embd])
-
-        # Output projection and dropout
+        # 6. Output projection & residual dropout
         out = self.proj(out)
-        out = self.resid_dropout(out, training=training)
+        out = self.resid_dropout(out)
         return out
 
 
-class MLP(tf.keras.layers.Layer):
+class MLP(nn.Module):
     """
     Feed-Forward Network (MLP) with GELU activation.
     """
 
-    def __init__(self, config: SUBConfig, **kwargs):
-        super().__init__(**kwargs)
-        self.fc1 = tf.keras.layers.Dense(config.ffn_mult * config.n_embd, use_bias=False, name="fc1")
-        self.fc2 = tf.keras.layers.Dense(config.n_embd, use_bias=False, name="fc2")
-        self.dropout = tf.keras.layers.Dropout(config.dropout)
+    def __init__(self, config: SUBConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.n_embd, config.ffn_mult * config.n_embd, bias=False)
+        self.fc2 = nn.Linear(config.ffn_mult * config.n_embd, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
 
-    def call(self, x, training=False):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.fc1(x)
-        h = tf.keras.activations.gelu(h, approximate=True)
+        # Approximate tanh formulation matches C engine and TF gelu(approximate=True)
+        h = F.gelu(h, approximate="tanh")
         h = self.fc2(h)
-        h = self.dropout(h, training=training)
+        h = self.dropout(h)
         return h
 
 
-class Block(tf.keras.layers.Layer):
+class Block(nn.Module):
     """
     Pre-LayerNorm Transformer Block.
     """
 
-    def __init__(self, config: SUBConfig, **kwargs):
-        super().__init__(**kwargs)
-        self.ln_1 = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="ln_1")
-        self.attn = CausalSelfAttention(config, name="attn")
-        self.ln_2 = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="ln_2")
-        self.mlp = MLP(config, name="mlp")
+    def __init__(self, config: SUBConfig):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd, eps=1e-5)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd, eps=1e-5)
+        self.mlp = MLP(config)
 
-    def call(self, x, training=False):
-        x = x + self.attn(self.ln_1(x), training=training)
-        x = x + self.mlp(self.ln_2(x), training=training)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
-class SUBModel(tf.keras.Model):
+class SUBModel(nn.Module):
     """
     Full SUB-AI Transformer Language Model with tied input/output embeddings.
     """
 
-    def __init__(self, config: SUBConfig, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, config: SUBConfig):
+        super().__init__()
         self.config = config
 
-        self.token_emb = tf.keras.layers.Embedding(
-            config.vocab_size, config.n_embd, name="token_emb"
-        )
-        self.pos_emb = tf.keras.layers.Embedding(
-            config.context_len, config.n_embd, name="pos_emb"
-        )
-        self.drop = tf.keras.layers.Dropout(config.dropout)
-        self.blocks = [Block(config, name=f"block_{i}") for i in range(config.n_layers)]
-        self.ln_f = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="ln_f")
+        self.token_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.context_len, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
+        self.ln_f = nn.LayerNorm(config.n_embd, eps=1e-5)
 
-    def call(self, idx, training=False):
+    def forward(
+        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass.
         Args:
-            idx: Tensor of shape [B, T] with token IDs.
+            idx: LongTensor of shape [B, T] with token IDs.
+            targets: Optional LongTensor of shape [B, T] with next-token IDs.
         Returns:
             logits: Tensor of shape [B, T, vocab_size].
+            loss: Cross entropy loss if targets provided, else None.
         """
-        B = tf.shape(idx)[0]
-        T = tf.shape(idx)[1]
+        device = idx.device
+        B, T = idx.size()
+
+        assert T <= self.config.context_len, f"Cannot forward sequence of length {T}, context_len is {self.config.context_len}"
+
+        # Positions 0 .. T-1
+        pos = torch.arange(0, T, dtype=torch.long, device=device)
 
         # Token + Position Embeddings
-        pos = tf.range(0, T, dtype=tf.int32)
-        tok_embeddings = self.token_emb(idx)
-        pos_embeddings = self.pos_emb(pos)
-        x = tok_embeddings + pos_embeddings
-        x = self.drop(x, training=training)
+        tok_embeddings = self.token_emb(idx)      # [B, T, n_embd]
+        pos_embeddings = self.pos_emb(pos)        # [T, n_embd]
+        x = self.drop(tok_embeddings + pos_embeddings)
 
         # Transformer Blocks
         for block in self.blocks:
-            x = block(x, training=training)
+            x = block(x)
 
         # Final LayerNorm
-        x = self.ln_f(x)
+        x = self.ln_f(x)                          # [B, T, n_embd]
 
-        # Weight-tied LM Head: logits = x @ W_emb^T
-        # token_emb.embeddings has shape [vocab_size, n_embd]
-        emb_weights = self.token_emb.embeddings
-        logits = tf.matmul(x, emb_weights, transpose_b=True)
-        return logits
+        # Weight-tied LM Head: logits = x @ token_emb.weight.T
+        # token_emb.weight has shape [vocab_size, n_embd]
+        logits = F.linear(x, self.token_emb.weight)  # [B, T, vocab_size]
 
-    def generate(self, prompt_ids, max_new_tokens, temperature=1.0, top_k=None):
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids: List[int],
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> List[int]:
         """
-        Autoregressive generation loop in NumPy.
+        Autoregressive generation loop.
         Args:
-            prompt_ids: List or 1D array of token IDs.
+            prompt_ids: List of token IDs.
             max_new_tokens: Number of tokens to generate.
-            temperature: Sampling temperature.
+            temperature: Sampling temperature (1.0 = standard, <1.0 = conservative, >1.0 = creative).
             top_k: Top-k filtering limit.
+            device: Target device (CPU or CUDA).
         Returns:
             List of generated token IDs including prompt.
         """
+        self.eval()
+        if device is None:
+            device = next(self.parameters()).device
+
         curr_ids = list(prompt_ids)
         if not curr_ids:
             curr_ids = [0]
 
+        idx = torch.tensor([curr_ids], dtype=torch.long, device=device)
+
         for _ in range(max_new_tokens):
-            # Crop to context length
-            inp = curr_ids[-self.config.context_len:]
-            inp_tensor = tf.constant([inp], dtype=tf.int32)
-            logits = self(inp_tensor, training=False).numpy()[0, -1, :]  # [vocab_size]
+            # Crop to maximum context length
+            idx_cond = idx[:, -self.config.context_len:]
+            logits, _ = self(idx_cond)
+            # Focus only on the last time step
+            logits = logits[:, -1, :]  # [1, vocab_size]
 
             if temperature <= 0.0 or top_k == 1:
-                next_id = int(np.argmax(logits))
+                next_id = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                logits = logits / temperature
-                if top_k is not None and 0 < top_k < len(logits):
-                    top_k_indices = np.argpartition(logits, -top_k)[-top_k:]
-                    top_k_logits = logits[top_k_indices]
-                    top_k_probs = np.exp(top_k_logits - np.max(top_k_logits))
-                    top_k_probs = top_k_probs / np.sum(top_k_probs)
-                    next_id = int(np.random.choice(top_k_indices, p=top_k_probs))
-                else:
-                    probs = np.exp(logits - np.max(logits))
-                    probs = probs / np.sum(probs)
-                    next_id = int(np.random.choice(len(probs), p=probs))
+                logits = logits / max(temperature, 1e-5)
+                if top_k is not None and 0 < top_k < logits.size(-1):
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float("Inf")
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
 
-            curr_ids.append(next_id)
+            idx = torch.cat((idx, next_id), dim=1)
 
-        return curr_ids
+        return idx[0].tolist()
