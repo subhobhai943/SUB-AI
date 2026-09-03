@@ -8,6 +8,7 @@ venv/
 # Build and binary artifacts
 *.o
 engine/inference
+engine/inference.exe
 model.bin
 
 # Checkpoints
