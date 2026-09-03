@@ -3,7 +3,7 @@
  *
  * Usage:
  *   ./inference --model model.bin --tokenizer data/tokenizer.json \
- *               --prompt "hello" --max_tokens 200 --temperature 0.8 --top_k 40
+ *               --prompt "hello" --max_tokens 200 --temperature 0.8 --top_k 40 --repeat_penalty 1.15
  *
  * Implements end-to-end autoregressive generation with streaming output.
  */
@@ -22,24 +22,26 @@
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options]\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --model <path>        Path to binary model file (default: model.bin)\n");
-    fprintf(stderr, "  --tokenizer <path>    Path to tokenizer.json (default: data/tokenizer.json)\n");
-    fprintf(stderr, "  --prompt <str>        Input prompt string (default: \"\")\n");
-    fprintf(stderr, "  --max_tokens <n>      Maximum number of tokens to generate (default: 200)\n");
-    fprintf(stderr, "  --temperature <f>     Sampling temperature (default: 0.8)\n");
-    fprintf(stderr, "  --top_k <n>           Top-K filtering limit (default: 40)\n");
-    fprintf(stderr, "  --seed <n>            Random seed (default: current time)\n");
-    fprintf(stderr, "  --help                Show this help message\n");
+    fprintf(stderr, "  --model <path>          Path to binary model file (default: model.bin)\n");
+    fprintf(stderr, "  --tokenizer <path>      Path to tokenizer.json (default: data/tokenizer.json)\n");
+    fprintf(stderr, "  --prompt <str>          Input prompt string (default: \"\")\n");
+    fprintf(stderr, "  --max_tokens <n>        Maximum number of tokens to generate (default: 200)\n");
+    fprintf(stderr, "  --temperature <f>       Sampling temperature (default: 0.8)\n");
+    fprintf(stderr, "  --top_k <n>             Top-K filtering limit (default: 40)\n");
+    fprintf(stderr, "  --repeat_penalty <f>    Repetition penalty factor (default: 1.15)\n");
+    fprintf(stderr, "  --seed <n>              Random seed (default: current time)\n");
+    fprintf(stderr, "  --help                  Show this help message\n");
 }
 
 int main(int argc, char *argv[]) {
-    const char *model_path     = "model.bin";
-    const char *tokenizer_path = "data/tokenizer.json";
-    const char *prompt         = "";
-    int         max_tokens     = 200;
-    float       temperature    = 0.8f;
-    int         top_k          = 40;
-    unsigned int seed          = (unsigned int)time(NULL);
+    const char *model_path       = "model.bin";
+    const char *tokenizer_path   = "data/tokenizer.json";
+    const char *prompt           = "";
+    int         max_tokens       = 200;
+    float       temperature      = 0.8f;
+    int         top_k            = 40;
+    float       repeat_penalty   = 1.15f;
+    unsigned int seed            = (unsigned int)time(NULL);
 
     /* Parse CLI arguments */
     for (int i = 1; i < argc; i++) {
@@ -55,6 +57,8 @@ int main(int argc, char *argv[]) {
             temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top_k") == 0 && i + 1 < argc) {
             top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--repeat_penalty") == 0 && i + 1 < argc) {
+            repeat_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -95,10 +99,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 4. Allocate logits buffer */
+    /* 4. Allocate logits buffer and token history for repetition penalty */
     float *logits = (float *)malloc(hdr.vocab_size * sizeof(float));
-    if (!logits) {
-        fprintf(stderr, "Failed to allocate logits buffer\n");
+    int *history = (int *)malloc(hdr.context_len * sizeof(int));
+    if (!logits || !history) {
+        fprintf(stderr, "Failed to allocate buffers\n");
+        free(logits);
+        free(history);
         kvcache_free(&kv);
         tokenizer_free(&tok);
         free_model(&weights);
@@ -115,13 +122,17 @@ int main(int argc, char *argv[]) {
     }
 
     if (prompt_len == 0) {
-        /* If prompt is empty, seed with token 0 */
         prompt_ids[0] = 0;
         prompt_len = 1;
     }
 
     if (prompt_len > (int)hdr.context_len - 1) {
         prompt_len = (int)hdr.context_len - 1;
+    }
+
+    int history_len = 0;
+    for (int i = 0; i < prompt_len; i++) {
+        history[history_len++] = prompt_ids[i];
     }
 
     /* 6. Prefill prompt */
@@ -143,9 +154,16 @@ int main(int argc, char *argv[]) {
     }
 
     for (int step = 0; step < remaining; step++) {
+        /* Apply repetition penalty before sampling */
+        apply_repetition_penalty(logits, (int)hdr.vocab_size, history, history_len, repeat_penalty);
+
         int next_token = sample_topk(logits, (int)hdr.vocab_size, temperature, top_k);
         printf("%s", tokenizer_decode_id(&tok, next_token));
         fflush(stdout);
+
+        if (history_len < (int)hdr.context_len) {
+            history[history_len++] = next_token;
+        }
 
         if (transformer_forward(logits, next_token, current_pos, &hdr, &weights, &kv) != 0) {
             fprintf(stderr, "Forward pass failed during generation at position %d\n", current_pos);
@@ -157,6 +175,7 @@ int main(int argc, char *argv[]) {
 
     /* 8. Clean up resources */
     free(prompt_ids);
+    free(history);
     free(logits);
     kvcache_free(&kv);
     tokenizer_free(&tok);

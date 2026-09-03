@@ -1,8 +1,8 @@
 /*
  * sampler.c — Logit sampling implementations for SUB-AI inference engine.
  *
- * Implements greedy argmax selection and top-K temperature-scaled sampling
- * with categorical random selection.
+ * Implements greedy argmax selection, repetition penalty scaling, and
+ * top-K temperature-scaled sampling with categorical random selection.
  */
 
 #include "sampler.h"
@@ -14,6 +14,23 @@ typedef struct {
     float val;
     int   idx;
 } ProbIndex;
+
+void apply_repetition_penalty(float *logits, int vocab_size, const int *context_tokens, int context_len, float penalty) {
+    if (!logits || vocab_size <= 0 || !context_tokens || context_len <= 0 || penalty <= 1.0f) {
+        return;
+    }
+
+    for (int i = 0; i < context_len; i++) {
+        int tok = context_tokens[i];
+        if (tok >= 0 && tok < vocab_size) {
+            if (logits[tok] > 0.0f) {
+                logits[tok] /= penalty;
+            } else {
+                logits[tok] *= penalty;
+            }
+        }
+    }
+}
 
 int sample_argmax(const float *logits, int vocab_size) {
     if (!logits || vocab_size <= 0) return 0;

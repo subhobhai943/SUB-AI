@@ -16,4 +16,4 @@ checkpoints/
 
 # Data cache (keep tokenizer.json if desired, ignore raw and tokenized npy)
 data/*.npy
-data/input.txt
+data/*.txt
